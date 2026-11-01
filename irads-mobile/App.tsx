@@ -199,10 +199,20 @@ function calculateRouteLength(route: Coordinate[]): number {
   return total;
 }
 
+// Testing only: allows TFLite inference at 0 km/h; never saves idle predictions.
+const DIAGNOSTIC_BYPASS_SPEED_GATE = true;
+
 const POTHOLE_ALERT_DISTANCE_METERS = 100;
 const MAX_RIDER_ROUTE_OFFSET_METERS = 30;
 const ROUTE_CORRIDOR_METERS = 15;
 const ROUTE_PROGRESS_TOLERANCE_METERS = 10;
+// Automatic rerouting: confirm real departure from a road before calling OSRM.
+const REROUTE_OFFSET_METERS = 45;
+const REROUTE_MIN_FIX_SEPARATION_MS = 3000;
+const REROUTE_RETRY_INTERVAL_MS = 20000;
+const REROUTE_MIN_SPEED_KMH = 3;
+const REROUTE_MAX_GPS_AGE_MS = 10000;
+const REROUTE_MAX_GPS_ACCURACY_METERS = 25;
 
 // ============================================================
 // APP
@@ -216,7 +226,25 @@ export default function App() {
   const speedRef = useRef<number | null>(null);
   const latestGpsFixRef = useRef<LiveGPSFix | null>(null);
   const aiServiceRef = useRef<AIService | null>(null);
-  const [aiStatus, setAiStatus] = useState("Waiting for navigation.");
+  const [aiStatus, setAiStatus] = useState("Initializing on-device model...");
+  const [modelInitStatus, setModelInitStatus] = useState<"waiting" | "loading" | "ready" | "error">("loading");
+  // Diagnostic panel: sensor values are available without GPS (max ~4 UI updates/sec).
+  const [liveSensors, setLiveSensors] = useState<{
+    ax: number; ay: number; az: number;
+    gx: number; gy: number; gz: number;
+  } | null>(null);
+  const lastSensorUiUpdateRef = useRef(0);
+
+
+  // Diagnostic-only prediction banner: show every non-NORMAL classifier output,
+  // regardless of confidence, GPS or speed. Does NOT change persistence.
+  const [predictionBanner, setPredictionBanner] = useState<{
+    type: "POTHOLE" | "SPEED_BREAKER";
+    confidence: number;
+    count: number;
+  } | null>(null);
+  const predictionCountRef = useRef(0);
+  const predictionBannerTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Testing notification for successfully saved anomaly detections.
   const [detectionToast, setDetectionToast] = useState<
@@ -234,14 +262,22 @@ export default function App() {
 
   const [source, setSource] = useState("My location");
   const [selectedSourceCoordinate, setSelectedSourceCoordinate] = useState<Coordinate | null>(null);
+  const [pendingMapCoordinate, setPendingMapCoordinate] = useState<Coordinate | null>(null);
   const [sourceResults, setSourceResults] = useState<DestinationResult[]>([]);
   const [destination, setDestination] = useState("");
   // Exact selected destination coordinate is rendered as a red map pin.
   const [selectedDestinationCoordinate, setSelectedDestinationCoordinate] =
     useState<Coordinate | null>(null);
   const [destinationResults, setDestinationResults] = useState<DestinationResult[]>([]);
+  const [destinationSearchOpen, setDestinationSearchOpen] = useState(false);
   const [searchingDestination, setSearchingDestination] = useState(false);
   const [loadingRoute, setLoadingRoute] = useState(false);
+  // Nearby places use OpenStreetMap Overpass data. No new API key is needed.
+  const [nearbyCategory, setNearbyCategory] = useState<string | null>(null);
+  const [nearbyPlaces, setNearbyPlaces] = useState<DestinationResult[]>([]);
+  const [loadingNearby, setLoadingNearby] = useState(false);
+  const nearbyRequestRef = useRef(0);
+
 
   const [routeCoordinates, setRouteCoordinates] = useState<Coordinate[]>([]);
   const [routeDistanceMeters, setRouteDistanceMeters] = useState<number | null>(null);
@@ -297,7 +333,33 @@ export default function App() {
     percentage: 0,
   });
   const [navigationOnRoute, setNavigationOnRoute] = useState(false);
+  const [rerouteStatus, setRerouteStatus] = useState<string | null>(null);
+  const rerouteInFlightRef = useRef(false);
+  const rerouteLastAttemptRef = useRef(0);
+  const offRouteFirstFixAtRef = useRef<number | null>(null);
+  const offRouteFixCountRef = useRef(0);
+  const rerouteSessionRef = useRef(0);
+  const rerouteStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const navigationActiveRef = useRef(false);
+  const destinationForRerouteRef = useRef<Coordinate | null>(null);
+
+  function showRerouteStatus(message: string, clearAfterMs = 0) {
+    if (rerouteStatusTimerRef.current !== null) clearTimeout(rerouteStatusTimerRef.current);
+    setRerouteStatus(message);
+    if (clearAfterMs > 0) {
+      rerouteStatusTimerRef.current = setTimeout(() => {
+        setRerouteStatus(null);
+        rerouteStatusTimerRef.current = null;
+      }, clearAfterMs);
+    }
+  }
+
   const alertedHazardsRef = useRef<Set<string>>(new Set());
+  const [potholeAheadAlert, setPotholeAheadAlert] = useState<{
+    distance: number;
+    level: "LOW" | "MEDIUM" | "HIGH" | "UNKNOWN";
+  } | null>(null);
+  const potholeAheadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [recenterRequest, setRecenterRequest] = useState(0);
 
   const [loadingLocation, setLoadingLocation] = useState(true);
@@ -521,17 +583,13 @@ export default function App() {
   }, []);
 
   // ----------------------------------------------------------
-  // SPEED-GATED SENSOR COLLECTION + TFLITE INFERENCE
+  // GPS-INDEPENDENT DIAGNOSTIC INFERENCE
   // ----------------------------------------------------------
 
+  // Model initialization and raw sensor collection run while this screen is
+  // mounted, regardless of navigation or GPS quality. GPS and speed validation
+  // still control whether an anomaly can be saved/uploaded.
   useEffect(() => {
-    // Sensor collection and inference remain OFF until navigation starts.
-    if (!isNavigating) {
-      console.log("Navigation inactive: sensor collection stopped.");
-      setAiStatus("Stopped. Start navigation to run the model.");
-      return;
-    }
-
     // react-native-fast-tflite requires a native development build.
     // Keep the browser map usable without trying to load the native runtime.
     if (Platform.OS === "web") {
@@ -546,6 +604,7 @@ export default function App() {
 
     async function startInferenceAndSensors() {
       try {
+        setModelInitStatus("loading");
         setAiStatus("Loading on-device TFLite model...");
         console.log("Initializing IRADS TFLite model.");
 
@@ -558,6 +617,7 @@ export default function App() {
         }
 
         aiServiceRef.current = service;
+        setModelInitStatus("ready");
 
         service.onAnomalySaved = (type) => {
           if (!active) return;
@@ -574,7 +634,7 @@ export default function App() {
           }, 3000);
         };
         setAiStatus(
-          `Model ready. Waiting for ${SENSOR_WINDOW_SIZE} sensor samples at speed >= 5 km/h.`,
+          `Model ready. TEST MODE: running inference while stationary; saving still requires valid GPS and speed.`,
         );
         console.log("IRADS TFLite model initialized.");
 
@@ -583,6 +643,13 @@ export default function App() {
           // speed gate rejects the sample, so sensor delivery can be verified
           // safely while the phone is stationary.
           const sensorDebugNow = Date.now();
+          if (sensorDebugNow - lastSensorUiUpdateRef.current >= 250) {
+            lastSensorUiUpdateRef.current = sensorDebugNow;
+            setLiveSensors({
+              ax: sample.ax, ay: sample.ay, az: sample.az,
+              gx: sample.gx, gy: sample.gy, gz: sample.gz,
+            });
+          }
           if (sensorDebugNow - lastSensorDebugLogAt >= 1000) {
             console.log("IRADS RAW SENSOR DEBUG:", {
               timestamp: sample.timestamp,
@@ -606,9 +673,11 @@ export default function App() {
 
           const gate = checkSpeedGate(speedRef.current);
 
-          // Do not feed stationary/invalid-speed readings into a window.
-          // WindowManager also resets a window when it sees a gap >100 ms.
-          if (!gate.allowed) {
+          // Diagnostic mode: feed stationary samples to TFLite as well.
+          // Normal speed gating can be restored by setting this flag to false.
+          // When the gate is closed, GPS is deliberately omitted below so
+          // stationary test predictions are never recorded as road hazards.
+          if (!DIAGNOSTIC_BYPASS_SPEED_GATE && !gate.allowed) {
             return;
           }
 
@@ -629,7 +698,7 @@ export default function App() {
             Number.isFinite(fix.speedKmh);
 
           const gps: SensorReading["gps"] =
-            fix && gpsIsFresh && gpsIsAccurate && gpsHasSpeed
+            gate.allowed && fix && gpsIsFresh && gpsIsAccurate && gpsHasSpeed
               ? {
                   lat: fix.latitude,
                   lng: fix.longitude,
@@ -671,11 +740,29 @@ export default function App() {
                 gpsAttached: gps !== null,
               });
 
+              // Display raw non-NORMAL classifications even when the backend's
+              // 70% confidence threshold or GPS/speed gate prevents saving.
+              if (prediction.type === "POTHOLE" || prediction.type === "SPEED_BREAKER") {
+                predictionCountRef.current += 1;
+                setPredictionBanner({
+                  type: prediction.type,
+                  confidence: prediction.confidence,
+                  count: predictionCountRef.current,
+                });
+                if (predictionBannerTimerRef.current !== null) {
+                  clearTimeout(predictionBannerTimerRef.current);
+                }
+                predictionBannerTimerRef.current = setTimeout(() => {
+                  setPredictionBanner(null);
+                  predictionBannerTimerRef.current = null;
+                }, 1800);
+              }
+
               if (prediction.type === "NORMAL") {
                 setAiStatus(`Model: NORMAL (${percent}%).`);
               } else if (gps === null) {
                 setAiStatus(
-                  `Model: ${prediction.type} (${percent}%), but GPS is stale/inaccurate; event not saved.`,
+                  `TEST prediction: ${prediction.type} (${percent}%). Not saved (speed gate or GPS validation).`,
                 );
               } else {
                 setAiStatus(
@@ -694,10 +781,11 @@ export default function App() {
             });
         });
 
-        console.log("Navigation started: sensor collection and inference enabled.");
+        console.log("Diagnostic inference active independently of GPS and navigation.");
       } catch (error) {
         if (!active) return;
         console.error("Could not initialize IRADS TFLite inference:", error);
+        setModelInitStatus("error");
         setAiStatus(
           `Model initialization failed: ${
             error instanceof Error ? error.message : "see console"
@@ -715,14 +803,18 @@ export default function App() {
       if (aiServiceRef.current) {
         aiServiceRef.current.onAnomalySaved = undefined;
       }
+      if (predictionBannerTimerRef.current !== null) {
+        clearTimeout(predictionBannerTimerRef.current);
+        predictionBannerTimerRef.current = null;
+      }
       if (detectionToastTimerRef.current !== null) {
         clearTimeout(detectionToastTimerRef.current);
         detectionToastTimerRef.current = null;
       }
       setDetectionToast(null);
-      console.log("Navigation stopped: sensor collection disabled.");
+      console.log("App unmounted: sensor collection disabled.");
     };
-  }, [isNavigating]);
+  }, []);
 
   // ----------------------------------------------------------
   // FETCH ANOMALIES FROM FASTAPI
@@ -939,6 +1031,123 @@ export default function App() {
     void fetchRouteHazards(routeCoordinates);
   }, [routeSelected, routeCoordinates, fetchRouteHazards]);
 
+  // Recalculate the route when two separate high-quality GPS fixes confirm
+  // the rider has left the displayed route. The model/sensor pipeline is unchanged.
+  useEffect(() => {
+    if (!isNavigating || !routeSelected || routeCoordinates.length < 2 ||
+        !selectedDestinationCoordinate || !currentLocation) {
+      offRouteFirstFixAtRef.current = null;
+      offRouteFixCountRef.current = 0;
+      return;
+    }
+
+    const fix = latestGpsFixRef.current;
+    const now = Date.now();
+    if (!fix || now - fix.timestamp > REROUTE_MAX_GPS_AGE_MS ||
+        fix.accuracyM === null || fix.accuracyM > REROUTE_MAX_GPS_ACCURACY_METERS) {
+      return;
+    }
+    // Slow or stationary GPS drift should not trigger a new route.
+    if (fix.speedKmh !== null && fix.speedKmh < REROUTE_MIN_SPEED_KMH) {
+      offRouteFirstFixAtRef.current = null;
+      offRouteFixCountRef.current = 0;
+      return;
+    }
+    const offset = projectOntoRoute(fix, routeCoordinates)?.distanceToRouteMeters;
+    if (offset === undefined || offset <= Math.max(REROUTE_OFFSET_METERS, fix.accuracyM * 2)) {
+      offRouteFirstFixAtRef.current = null;
+      offRouteFixCountRef.current = 0;
+      return;
+    }
+    if (offRouteFirstFixAtRef.current === null) {
+      offRouteFirstFixAtRef.current = fix.timestamp;
+      offRouteFixCountRef.current = 1;
+      return;
+    }
+    offRouteFixCountRef.current += 1;
+    if (offRouteFixCountRef.current < 2 ||
+        fix.timestamp - offRouteFirstFixAtRef.current < REROUTE_MIN_FIX_SEPARATION_MS ||
+        rerouteInFlightRef.current ||
+        now - rerouteLastAttemptRef.current < REROUTE_RETRY_INTERVAL_MS) return;
+
+    const destinationAtRequest = selectedDestinationCoordinate;
+    const sessionAtRequest = rerouteSessionRef.current;
+    rerouteInFlightRef.current = true;
+    rerouteLastAttemptRef.current = now;
+    offRouteFirstFixAtRef.current = null;
+    offRouteFixCountRef.current = 0;
+    showRerouteStatus("Off route — finding a new route...");
+
+    void (async () => {
+      try {
+        const coordinatePair =
+          `${fix.longitude},${fix.latitude};${destinationAtRequest.longitude},${destinationAtRequest.latitude}`;
+        const url = `https://router.project-osrm.org/route/v1/driving/${coordinatePair}` +
+          "?overview=full&geometries=geojson&steps=true";
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 12000);
+        let response: Response;
+        try {
+          response = await fetch(url, { signal: controller.signal });
+        } finally {
+          clearTimeout(timer);
+        }
+        if (!response.ok) throw new Error(`Routing HTTP ${response.status}`);
+        const data = await response.json();
+        const route = data?.routes?.[0];
+        if (data?.code !== "Ok" || !Array.isArray(route?.geometry?.coordinates) ||
+            route.geometry.coordinates.length < 2 ||
+            !Number.isFinite(Number(route.distance)) ||
+            !Number.isFinite(Number(route.duration))) {
+          throw new Error("No replacement driving route available");
+        }
+        const points: Coordinate[] = route.geometry.coordinates.map((point: [number, number]) => ({
+          longitude: Number(point[0]), latitude: Number(point[1]),
+        }));
+        if (points.some(point => !Number.isFinite(point.latitude) ||
+            !Number.isFinite(point.longitude))) throw new Error("Invalid route coordinates");
+        // Do not overwrite a newer destination or a stopped navigation session.
+        if (sessionAtRequest !== rerouteSessionRef.current ||
+            !navigationActiveRef.current ||
+            destinationForRerouteRef.current?.latitude !== destinationAtRequest.latitude ||
+            destinationForRerouteRef.current?.longitude !== destinationAtRequest.longitude) return;
+
+        setRouteCoordinates(points);
+        setRouteDistanceMeters(Number(route.distance));
+        setRouteDurationSeconds(Number(route.duration));
+        setNavigationProgress({ completedMeters: 0,
+          remainingMeters: Number(route.distance), percentage: 0 });
+        setNavigationOnRoute(true);
+        // New geometry causes the existing route-anomaly fetch to refresh.
+        alertedHazardsRef.current.clear();
+        showRerouteStatus("Route updated — continue to destination", 6000);
+        console.log("IRADS AUTO REROUTE SUCCESS", {
+          distanceMeters: route.distance, durationSeconds: route.duration,
+        });
+      } catch (error) {
+        if (sessionAtRequest !== rerouteSessionRef.current ||
+            !navigationActiveRef.current) return;
+        console.warn("IRADS AUTO REROUTE FAILED", error);
+        showRerouteStatus("Could not reroute — will retry when GPS and network allow", 6500);
+      } finally {
+        rerouteInFlightRef.current = false;
+      }
+    })();
+  }, [isNavigating, routeSelected, routeCoordinates, selectedDestinationCoordinate, currentLocation]);
+
+  // Stop stale reroutes when the destination changes or navigation ends.
+  useEffect(() => {
+    navigationActiveRef.current = isNavigating;
+    destinationForRerouteRef.current = selectedDestinationCoordinate;
+    if (!isNavigating) {
+      rerouteSessionRef.current += 1;
+      offRouteFirstFixAtRef.current = null;
+      offRouteFixCountRef.current = 0;
+      if (rerouteStatusTimerRef.current !== null) clearTimeout(rerouteStatusTimerRef.current);
+      setRerouteStatus(null);
+    }
+  }, [isNavigating, selectedDestinationCoordinate]);
+
   // Update progress and warn once per pothole as live GPS changes.
   // Route geometry is used so nearby roads and hazards behind the rider
   // do not generate warnings. These are foreground-only alerts.
@@ -978,10 +1187,11 @@ export default function App() {
         }
         return {
           id: hazard.id,
+          confidence: hazard.confidence,
           distanceAhead: projected.distanceAlongRouteMeters - rider.distanceAlongRouteMeters,
         };
       })
-      .filter((item): item is { id: string; distanceAhead: number } =>
+      .filter((item): item is { id: string; confidence: number; distanceAhead: number } =>
         item !== null && item.distanceAhead > 0 &&
         item.distanceAhead <= POTHOLE_ALERT_DISTANCE_METERS)
       .sort((a, b) => a.distanceAhead - b.distanceAhead);
@@ -993,11 +1203,30 @@ export default function App() {
     alertedHazardsRef.current.add(nearest.id);
 
     const distance = Math.max(1, Math.round(nearest.distanceAhead));
+    const confidence = nearest.confidence;
+    const level = !Number.isFinite(confidence) || confidence < 0.7
+      ? "UNKNOWN"
+      : confidence >= 0.9
+        ? "HIGH"
+        : confidence >= 0.8
+          ? "MEDIUM"
+          : "LOW";
+
+    setPotholeAheadAlert({ distance, level });
+    if (potholeAheadTimerRef.current !== null) {
+      clearTimeout(potholeAheadTimerRef.current);
+    }
+    potholeAheadTimerRef.current = setTimeout(() => {
+      setPotholeAheadAlert(null);
+      potholeAheadTimerRef.current = null;
+    }, 4000);
+
     const message = `Warning! Pothole ahead in ${distance} metres.`;
 
     console.log("IRADS POTHOLE ALERT:", {
       anomalyId: nearest.id,
       distanceMeters: distance,
+      confidenceLevel: level,
     });
 
     if (Platform.OS !== "web") {
@@ -1008,6 +1237,24 @@ export default function App() {
       });
     }
   }, [isNavigating, currentLocation, routeCoordinates, hazards]);
+
+  useEffect(() => {
+    if (!isNavigating) {
+      if (potholeAheadTimerRef.current !== null) {
+        clearTimeout(potholeAheadTimerRef.current);
+        potholeAheadTimerRef.current = null;
+      }
+      setPotholeAheadAlert(null);
+    }
+  }, [isNavigating]);
+
+  useEffect(() => {
+    return () => {
+      if (potholeAheadTimerRef.current !== null) {
+        clearTimeout(potholeAheadTimerRef.current);
+      }
+    };
+  }, []);
 
   // ----------------------------------------------------------
   // MAP CONFIGURATION
@@ -1053,6 +1300,124 @@ export default function App() {
   // ----------------------------------------------------------
   // SOURCE SEARCH, DESTINATION SEARCH AND ROUTING
   // ----------------------------------------------------------
+
+  function resetPlannedRoute() {
+    setRouteSelected(false);
+    setIsNavigating(false);
+    setRouteCoordinates([]);
+    setRouteDistanceMeters(null);
+    setRouteDurationSeconds(null);
+    setHazards([]);
+    setHazardError(null);
+    alertedHazardsRef.current.clear();
+  }
+
+  // Long-press a map point to choose a start or destination without geocoding.
+  // While navigating, the live GPS route remains the only navigation source.
+  function handleMapLongPress(coordinate: Coordinate) {
+    if (isNavigating || loadingRoute) return;
+    setPendingMapCoordinate(coordinate);
+  }
+
+  function handleUseMapPoint(kind: "source" | "destination") {
+    const coordinate = pendingMapCoordinate;
+    if (!coordinate || isNavigating || loadingRoute) return;
+    const coordinateLabel = `${coordinate.latitude.toFixed(5)}, ${coordinate.longitude.toFixed(5)}`;
+    resetPlannedRoute();
+    setSourceResults([]);
+    setDestinationResults([]);
+    setNearbyPlaces([]);
+    setNearbyCategory(null);
+    if (kind === "source") {
+      setSource(`Map: ${coordinateLabel}`);
+      setSelectedSourceCoordinate(coordinate);
+    } else {
+      setDestination(`Map: ${coordinateLabel}`);
+      setSelectedDestinationCoordinate(coordinate);
+    }
+    setPendingMapCoordinate(null);
+  }
+
+  function handleSwapLocations() {
+    if (loadingRoute || searchingDestination) return;
+    // A symbolic "My location" must be frozen to its current GPS coordinates
+    // when moved to the destination field; otherwise a route could chase itself.
+    const oldOrigin = selectedSourceCoordinate ?? currentLocation;
+    const oldDestination = selectedDestinationCoordinate;
+    if (!oldOrigin || !oldDestination) {
+      showMessage("Select both locations", "Choose a starting point and select a destination result before swapping.");
+      return;
+    }
+    const oldSourceLabel = source.trim().toLowerCase() === "my location"
+      ? "Previous starting location"
+      : source;
+    setSource(destination);
+    setSelectedSourceCoordinate(oldDestination);
+    setDestination(oldSourceLabel);
+    setSelectedDestinationCoordinate(oldOrigin);
+    setSourceResults([]);
+    setDestinationResults([]);
+    setNearbyPlaces([]);
+    setNearbyCategory(null);
+    resetPlannedRoute();
+    showMessage("Locations swapped", "Tap GO to find the return route. Your previous GPS starting point is fixed as the destination.");
+  }
+
+  async function handleSearchNearby(category: string) {
+    const center = currentLocation ?? selectedSourceCoordinate;
+    if (!center) {
+      showMessage("Location unavailable", "Wait for GPS or select a starting point before searching nearby places.");
+      return;
+    }
+    const filters: Record<string, string> = {
+      Hospital: '["amenity"="hospital"]',
+      Fuel: '["amenity"="fuel"]',
+      Restaurant: '["amenity"="restaurant"]',
+      Cafe: '["amenity"="cafe"]',
+      Pharmacy: '["amenity"="pharmacy"]',
+      Parking: '["amenity"="parking"]',
+      Metro: '["railway"="station"]["station"="subway"]',
+    };
+    const filter = filters[category];
+    if (!filter) return;
+    const request = ++nearbyRequestRef.current;
+    setNearbyCategory(category);
+    setNearbyPlaces([]);
+    setLoadingNearby(true);
+    try {
+      const radius = 5000;
+      const query = `[out:json][timeout:20];(nwr(around:${radius},${center.latitude},${center.longitude})${filter};);out center 30;`;
+      const response = await fetch("https://overpass.kumi.systems/api/interpreter", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: `data=${encodeURIComponent(query)}`,
+      });
+      if (!response.ok) throw new Error(`Nearby search returned HTTP ${response.status}.`);
+      const json = await response.json();
+      const elements = Array.isArray(json?.elements) ? json.elements : [];
+      const places: DestinationResult[] = elements.map((item: any) => {
+        const lat = Number(item.lat ?? item.center?.lat);
+        const lon = Number(item.lon ?? item.center?.lon);
+        const name = String(item.tags?.name ?? `${category} (${item.id})`);
+        const address = [item.tags?.["addr:street"], item.tags?.["addr:suburb"], item.tags?.["addr:city"]]
+          .filter(Boolean).join(", ");
+        return { id: `${item.type}-${item.id}`, name, address: address || category,
+          coordinate: { latitude: lat, longitude: lon } };
+      }).filter((place: DestinationResult) =>
+        Number.isFinite(place.coordinate.latitude) && Number.isFinite(place.coordinate.longitude))
+        .sort((a: DestinationResult, b: DestinationResult) =>
+          distanceMeters(center, a.coordinate) - distanceMeters(center, b.coordinate))
+        .slice(0, 12);
+      if (request !== nearbyRequestRef.current) return;
+      setNearbyPlaces(places);
+      if (!places.length) showMessage("No nearby places found", `No mapped ${category.toLowerCase()} locations were returned within 5 km.`);
+    } catch (error) {
+      if (request !== nearbyRequestRef.current) return;
+      showMessage("Nearby search unavailable", error instanceof Error ? error.message : "Check your internet connection and retry.");
+    } finally {
+      if (request === nearbyRequestRef.current) setLoadingNearby(false);
+    }
+  }
 
   async function handleSearchSource() {
     const query = source.trim();
@@ -1133,6 +1498,13 @@ export default function App() {
       showMessage("Destination required", "Enter a place, address, or landmark to search.");
       return;
     }
+    if (selectedDestinationCoordinate) {
+      void handleSelectDestination({
+        id: "selected-destination", name: destination, address: destination,
+        coordinate: selectedDestinationCoordinate,
+      });
+      return;
+    }
 
     setSearchingDestination(true);
     setDestinationResults([]);
@@ -1146,23 +1518,35 @@ export default function App() {
     try {
       // Photon is used instead of calling Nominatim directly from the app.
       // Public geocoding services may rate-limit or block mobile requests.
-      const params = new URLSearchParams({ q: query, limit: "5" });
-      if (currentLocation) {
-        params.set("lat", String(currentLocation.latitude));
-        params.set("lon", String(currentLocation.longitude));
+      // Constrain Photon to Bengaluru for local landmark searches. Photon is global:
+      // without a geographic bound, "Trinity" can resolve to a US location.
+      const bengaluruArea = { west: 77.35, south: 12.73, east: 77.94, north: 13.23 };
+      const center = currentLocation ?? INITIAL_LOCATION;
+      const nearBengaluru = center.latitude >= 12.6 && center.latitude <= 13.4 &&
+        center.longitude >= 77.2 && center.longitude <= 78.1;
+      const area = nearBengaluru ? bengaluruArea : {
+        west: center.longitude - 0.25, east: center.longitude + 0.25,
+        south: center.latitude - 0.25, north: center.latitude + 0.25,
+      };
+      const queries = [query];
+      if (/bengaluru|bangalore/i.test(query)) {
+        const shorter = query.replace(/\b(bengaluru|bangalore)\b/gi, "").replace(/[, ]+/g, " ").trim();
+        if (shorter && shorter !== query) queries.push(shorter);
       }
-
-      const response = await fetch(
-        `https://photon.komoot.io/api/?${params.toString()}`,
-        { headers: { "Accept": "application/geo+json" } }
-      );
-
-      if (!response.ok) {
-        throw new Error(`Destination search returned HTTP ${response.status}.`);
+      if (/\btrinity\b/i.test(query)) queries.push("Trinity Metro Station");
+      let features: any[] = [];
+      for (const phrase of [...new Set(queries)]) {
+        const params = new URLSearchParams({ q: phrase, limit: "15",
+          bbox: `${area.west},${area.south},${area.east},${area.north}`,
+          lat: String(center.latitude), lon: String(center.longitude) });
+        const response = await fetch(`https://photon.komoot.io/api/?${params.toString()}`,
+          { headers: { Accept: "application/geo+json" } });
+        if (!response.ok) throw new Error(`Destination search returned HTTP ${response.status}.`);
+        const results = await response.json();
+        const matching = Array.isArray(results?.features) ? results.features : [];
+        features.push(...matching);
+        if (features.length >= 8) break;
       }
-
-      const results = await response.json();
-      const features = Array.isArray(results?.features) ? results.features : [];
       const places: DestinationResult[] = features
         .filter((feature: any) =>
           Array.isArray(feature?.geometry?.coordinates) &&
@@ -1194,7 +1578,15 @@ export default function App() {
               latitude: Number(feature.geometry.coordinates[1]),
             },
           };
-        });
+        })
+        .filter((place: DestinationResult) =>
+          place.coordinate.latitude >= area.south && place.coordinate.latitude <= area.north &&
+          place.coordinate.longitude >= area.west && place.coordinate.longitude <= area.east)
+        .filter((place: DestinationResult, i: number, all: DestinationResult[]) =>
+          all.findIndex((candidate) => candidate.id === place.id) === i)
+        .sort((a: DestinationResult, b: DestinationResult) =>
+          distanceMeters(center, a.coordinate) - distanceMeters(center, b.coordinate))
+        .slice(0, 10);
 
       setDestinationResults(places);
 
@@ -1220,6 +1612,9 @@ export default function App() {
     }
 
     setDestination(place.name);
+    setDestinationSearchOpen(false);
+    setNearbyPlaces([]);
+    setNearbyCategory(null);
     setDestinationResults([]);
     setLoadingRoute(true);
     setSelectedDestinationCoordinate(null);
@@ -1386,7 +1781,7 @@ export default function App() {
       <View style={styles.header}>
         <View>
           <Text style={styles.logo}>IRADS</Text>
-          <Text style={styles.subtitle}>Road intelligence</Text>
+          <Text style={styles.subtitle}>Road intelligence | BUILD 31OCT-G · {modelInitStatus === "ready" ? "AI ready" : modelInitStatus === "error" ? "AI error" : "AI loading"}</Text>
         </View>
 
         <TouchableOpacity
@@ -1440,46 +1835,127 @@ export default function App() {
           )}
         </View>
 
+        <View style={{ alignItems: "center", paddingVertical: 3 }}>
+          <TouchableOpacity onPress={handleSwapLocations} accessibilityLabel="Swap source and destination"
+            style={{ backgroundColor: "#23384C", paddingVertical: 4, paddingHorizontal: 14, borderRadius: 8 }}>
+            <Text style={{ color: "#E2E8F0", fontWeight: "700", fontSize: 12 }}>⇅ Swap locations</Text>
+          </TouchableOpacity>
+        </View>
+
         <View style={styles.searchDivider} />
 
         <View style={styles.searchRow}>
           <View style={styles.destinationPin} />
 
-          <TextInput
-            style={styles.searchInput}
-            value={destination}
-            onChangeText={(text) => {
-              setDestination(text);
-              setDestinationResults([]);
-              setSelectedDestinationCoordinate(null);
-              setRouteSelected(false);
-              setIsNavigating(false);
-              setRouteCoordinates([]);
-              setRouteDistanceMeters(null);
-              setRouteDurationSeconds(null);
-              setHazards([]);
-            }}
-            placeholder="Where do you want to go?"
-            placeholderTextColor="#8995A3"
-            returnKeyType="search"
-            onSubmitEditing={handleSearchRoute}
-            accessibilityLabel="Destination"
-          />
-
+          <TouchableOpacity
+            style={{ flex: 1, justifyContent: "center", minHeight: 48 }}
+            accessibilityRole="button"
+            accessibilityLabel="Search for a destination or nearby places"
+            onPress={() => setDestinationSearchOpen(true)}
+          >
+            <Text numberOfLines={1} style={{ color: destination ? "#F8FAFC" : "#A7B3C2", fontSize: 14 }}>
+              {destination || "Search destination or nearby places"}
+            </Text>
+          </TouchableOpacity>
           <TouchableOpacity
             style={styles.searchButton}
-            onPress={handleSearchRoute}
+            onPress={() => {
+              if (selectedDestinationCoordinate) void handleSearchRoute();
+              else setDestinationSearchOpen(true);
+            }}
           >
-            <Text style={styles.searchButtonText}>GO</Text>
+            <Text style={styles.searchButtonText}>{selectedDestinationCoordinate ? "GO" : "SEARCH"}</Text>
           </TouchableOpacity>
         </View>
       </View> : null}
+
+      {isNavigating && rerouteStatus !== null && (
+        <View style={styles.rerouteBanner}>
+          {rerouteStatus.startsWith("Off route") && <ActivityIndicator size="small" color="#FBBF24" />}
+          <Text style={styles.rerouteBannerText}>{rerouteStatus}</Text>
+        </View>
+      )}
 
       {isNavigating && (
         <View style={styles.navDestinationBanner}>
           <Text style={styles.navDestinationText} numberOfLines={1}>Navigating to {destination}</Text>
         </View>
       )}
+
+      {/* Search results live in a dedicated modal rather than pushing the map down. */}
+      <Modal
+        visible={destinationSearchOpen && !isNavigating}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setDestinationSearchOpen(false)}
+      >
+        <View style={{ flex: 1, backgroundColor: "rgba(4, 10, 17, 0.93)", paddingTop: 56 }}>
+          <View style={{ backgroundColor: "#172433", marginHorizontal: 12, borderRadius: 18, padding: 16, flex: 1, marginBottom: 20 }}>
+            <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+              <Text style={{ fontSize: 20, fontWeight: "800", color: "#F8FAFC" }}>Choose destination</Text>
+              <TouchableOpacity onPress={() => setDestinationSearchOpen(false)} accessibilityLabel="Close destination search">
+                <Text style={{ color: "#CBD5E1", fontWeight: "800", fontSize: 24 }}>×</Text>
+              </TouchableOpacity>
+            </View>
+            <View style={{ backgroundColor: "#26384A", borderRadius: 12, flexDirection: "row", alignItems: "center", paddingLeft: 12, marginBottom: 16 }}>
+              <TextInput
+                style={[styles.searchInput, { minHeight: 52 }]}
+                value={destination}
+                onChangeText={(text) => {
+                  setDestination(text);
+                  setDestinationResults([]);
+                  setSelectedDestinationCoordinate(null);
+                  setRouteSelected(false);
+                  setRouteCoordinates([]);
+                  setRouteDistanceMeters(null);
+                  setRouteDurationSeconds(null);
+                  setHazards([]);
+                }}
+                placeholder="Try Trinity Metro Station, Bengaluru"
+                placeholderTextColor="#A7B3C2"
+                returnKeyType="search"
+                onSubmitEditing={() => void handleSearchRoute()}
+                accessibilityLabel="Search destination text"
+              />
+              <TouchableOpacity onPress={() => void handleSearchRoute()} style={[styles.searchButton, { marginRight: 6 }]}>
+                <Text style={styles.searchButtonText}>Find</Text>
+              </TouchableOpacity>
+            </View>
+            <ScrollView keyboardShouldPersistTaps="always" showsVerticalScrollIndicator={false}>
+              <Text style={{ color: "#CBD5E1", fontWeight: "700", marginBottom: 10 }}>NEARBY PLACES · within 5 km</Text>
+              <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 16 }}>
+                {["Hospital", "Fuel", "Restaurant", "Cafe", "Pharmacy", "Parking", "Metro"].map((category) => (
+                  <TouchableOpacity key={category} disabled={loadingNearby}
+                    onPress={() => void handleSearchNearby(category)}
+                    style={{ backgroundColor: nearbyCategory === category ? "#0F766E" : "#2A4054",
+                      borderRadius: 10, paddingHorizontal: 12, paddingVertical: 11 }}>
+                    <Text style={{ color: "#FFFFFF", fontSize: 13 }}>{category}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+              {searchingDestination && <ActivityIndicator color="#38BDF8" size="small" />}
+              {loadingNearby && <Text style={styles.destinationResultText}>Finding nearby {nearbyCategory?.toLowerCase()} places...</Text>}
+              {loadingRoute && <Text style={styles.destinationResultText}>Calculating driving route...</Text>}
+              {destinationResults.map((place) => (
+                <TouchableOpacity key={`search-${place.id}`} style={styles.destinationResultItem}
+                  onPress={() => void handleSelectDestination(place)}>
+                  <Text style={styles.destinationResultName}>{place.name}</Text>
+                  <Text style={styles.destinationResultAddress}>{place.address}</Text>
+                </TouchableOpacity>
+              ))}
+              {nearbyPlaces.length > 0 && <Text style={[styles.destinationResultText, { marginTop: 14 }]}>Nearby {nearbyCategory}</Text>}
+              {nearbyPlaces.map((place) => (
+                <TouchableOpacity key={`nearby-${place.id}`} style={styles.destinationResultItem}
+                  onPress={() => void handleSelectDestination(place)}>
+                  <Text style={styles.destinationResultName}>{place.name}</Text>
+                  <Text style={styles.destinationResultAddress}>{place.address}</Text>
+                </TouchableOpacity>
+              ))}
+              <Text style={[styles.attributionText, { marginTop: 16 }]}>Search data © OpenStreetMap contributors</Text>
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
 
       {sourceResults.length > 0 && (
         <View style={styles.destinationResultsPanel}>
@@ -1492,34 +1968,6 @@ export default function App() {
           <TouchableOpacity style={styles.destinationResultItem} onPress={handleUseMyLocation}>
             <Text style={styles.destinationResultName}>Use my current location instead</Text>
           </TouchableOpacity>
-          <Text style={styles.attributionText}>Search data © OpenStreetMap contributors</Text>
-        </View>
-      )}
-
-      {(searchingDestination || loadingRoute) && (
-        <View style={styles.destinationResultsPanel}>
-          <ActivityIndicator size="small" color="#38BDF8" />
-          <Text style={styles.destinationResultText}>
-            {searchingDestination ? "Searching OpenStreetMap..." : "Calculating driving route..."}
-          </Text>
-        </View>
-      )}
-
-      {destinationResults.length > 0 && (
-        <View style={styles.destinationResultsPanel}>
-          {destinationResults.map((place) => (
-            <TouchableOpacity
-              key={place.id}
-              style={styles.destinationResultItem}
-              onPress={() => void handleSelectDestination(place)}
-            >
-              <Text style={styles.destinationResultName}>{place.name}</Text>
-              <Text style={styles.destinationResultAddress}>{place.address}</Text>
-            </TouchableOpacity>
-          ))}
-          <Text style={styles.attributionText}>
-            Search data © OpenStreetMap contributors
-          </Text>
         </View>
       )}
 
@@ -1535,10 +1983,41 @@ export default function App() {
           showHeatmap={showHeatmap}
           route={routeCoordinates}
           hazards={mapHazards}
+          sourceCoordinate={selectedSourceCoordinate}
+          sourceLabel={source || "Starting point"}
           destinationCoordinate={selectedDestinationCoordinate}
           destinationLabel={destination || "Destination"}
+          pendingMapCoordinate={pendingMapCoordinate}
+          onMapLongPress={handleMapLongPress}
           recenterRequest={recenterRequest}
         />
+
+        {!isNavigating && pendingMapCoordinate && (
+          <View style={{ position: "absolute", left: 12, right: 12, top: 12,
+            backgroundColor: "#142637", padding: 12, borderRadius: 12,
+            borderWidth: 1, borderColor: "#38BDF8", elevation: 6 }}>
+            <Text style={{ color: "#F8FAFC", fontWeight: "700", marginBottom: 4 }}>
+              Selected point: {pendingMapCoordinate.latitude.toFixed(5)}, {pendingMapCoordinate.longitude.toFixed(5)}
+            </Text>
+            <Text style={{ color: "#94A3B8", fontSize: 12, marginBottom: 9 }}>
+              Use this map location as your starting point or destination.
+            </Text>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <TouchableOpacity onPress={() => handleUseMapPoint("source")}
+                style={{ flex: 1, backgroundColor: "#166534", padding: 10, borderRadius: 8, alignItems: "center" }}>
+                <Text style={{ color: "#FFFFFF", fontWeight: "700" }}>Set Source</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => handleUseMapPoint("destination")}
+                style={{ flex: 1, backgroundColor: "#1D4ED8", padding: 10, borderRadius: 8, alignItems: "center" }}>
+                <Text style={{ color: "#FFFFFF", fontWeight: "700" }}>Set Destination</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={() => setPendingMapCoordinate(null)}
+                style={{ backgroundColor: "#475569", padding: 10, borderRadius: 8, alignItems: "center" }}>
+                <Text style={{ color: "#FFFFFF", fontWeight: "700" }}>×</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        )}
 
         {(loadingLocation || locationNotice) && (
           <View style={styles.locationBadge}>
@@ -1832,6 +2311,44 @@ export default function App() {
         </View>
       </Modal>
 
+      {/* Raw classifier diagnostic. Independent of GPS, speed and database saving. */}
+      {predictionBanner !== null && (
+        <View pointerEvents="none" style={styles.predictionBanner}>
+          <Text style={styles.predictionBannerTitle}>
+            {predictionBanner.type === "POTHOLE" ? "AI predicts: POTHOLE" : "AI predicts: SPEED BREAKER"}
+          </Text>
+          <Text style={styles.predictionBannerInfo}>
+            Confidence: {(predictionBanner.confidence * 100).toFixed(1)}%  |  Predictions: {predictionBanner.count}
+          </Text>
+          <Text style={styles.predictionBannerHint}>
+            Diagnostic prediction only — not necessarily saved
+          </Text>
+        </View>
+      )}
+
+      {/* Keep diagnostics in the model status state, not covering the map. */}
+      {isNavigating && potholeAheadAlert !== null && (
+        <View pointerEvents="none" style={styles.potholeAheadPopup}>
+          <View style={styles.potholeAheadHeader}>
+            <Text style={styles.potholeAheadTitle}>⚠ Pothole Ahead!</Text>
+            <View style={[
+              styles.potholeAheadBadge,
+              { backgroundColor: potholeAheadAlert.level === "HIGH" ? "#5B2A35"
+                : potholeAheadAlert.level === "MEDIUM" ? "#664719"
+                : potholeAheadAlert.level === "LOW" ? "#1B5E42" : "#475569" },
+            ]}>
+              <Text style={styles.potholeAheadBadgeText}>{potholeAheadAlert.level}</Text>
+            </View>
+          </View>
+          <Text style={styles.potholeAheadDistance}>
+            {potholeAheadAlert.distance} m ahead
+          </Text>
+          <Text style={styles.potholeAheadSubtitle}>
+            Caution: Road anomaly detected on your route
+          </Text>
+        </View>
+      )}
+
       {detectionToast !== null && (
         <View
           pointerEvents="none"
@@ -1861,6 +2378,137 @@ const styles = StyleSheet.create({
     backgroundColor: "#101820",
   },
 
+  modelInitBanner: {
+    position: "absolute",
+    top: 66,
+    left: 12,
+    right: 12,
+    zIndex: 1200,
+    elevation: 15,
+    backgroundColor: "#1E293B",
+    borderColor: "#475569",
+    borderWidth: 1,
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  modelInitText: {
+    color: "#F8FAFC",
+    textAlign: "center",
+    fontSize: 12,
+    fontWeight: "700",
+  },
+
+  liveSensorPanel: {
+    position: "absolute",
+    bottom: 120,
+    left: 12,
+    right: 12,
+    zIndex: 1100,
+    elevation: 14,
+    backgroundColor: "rgba(15, 23, 42, 0.94)",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#475569",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  liveSensorHeading: {
+    color: "#93C5FD",
+    fontSize: 11,
+    fontWeight: "800",
+    marginBottom: 5,
+  },
+  liveSensorValue: {
+    color: "#F8FAFC",
+    fontSize: 12,
+    fontVariant: ["tabular-nums"],
+    marginBottom: 3,
+  },
+  liveSensorMeta: {
+    color: "#CBD5E1",
+    fontSize: 10,
+    marginTop: 4,
+  },
+
+  potholeAheadPopup: {
+    position: "absolute",
+    top: 75,
+    left: 12,
+    right: 12,
+    zIndex: 2000,
+    elevation: 20,
+    backgroundColor: "#1F2937",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#334155",
+    padding: 16,
+    gap: 15,
+  },
+  potholeAheadHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  potholeAheadTitle: {
+    color: "#F8FAFC",
+    fontSize: 19,
+    fontWeight: "700",
+  },
+  potholeAheadBadge: {
+    borderRadius: 20,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+  },
+  potholeAheadBadgeText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "800",
+  },
+  potholeAheadDistance: {
+    color: "#FFFFFF",
+    fontSize: 27,
+    fontWeight: "700",
+  },
+  potholeAheadSubtitle: {
+    color: "#CBD5E1",
+    fontSize: 14,
+    lineHeight: 21,
+    marginBottom: 4,
+  },
+
+  predictionBanner: {
+    position: "absolute",
+    bottom: 120,
+    left: 12,
+    right: 12,
+    zIndex: 3000,
+    elevation: 25,
+    backgroundColor: "#172B45",
+    borderColor: "#38BDF8",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  predictionBannerTitle: {
+    color: "#FFFFFF",
+    textAlign: "center",
+    fontSize: 16,
+    fontWeight: "800",
+  },
+  predictionBannerInfo: {
+    color: "#BAE6FD",
+    textAlign: "center",
+    fontSize: 12,
+    marginTop: 3,
+  },
+  predictionBannerHint: {
+    color: "#CBD5E1",
+    textAlign: "center",
+    fontSize: 11,
+    marginTop: 3,
+  },
   detectionToast: {
     position: "absolute",
     top: 75,
@@ -2313,6 +2961,26 @@ const styles = StyleSheet.create({
   errorText: {
     color: "#F87171",
     fontSize: 11,
+    flexShrink: 1,
+  },
+
+  rerouteBanner: {
+    marginHorizontal: 20,
+    marginBottom: 8,
+    paddingHorizontal: 12,
+    paddingVertical: 11,
+    backgroundColor: "#243244",
+    borderColor: "#F59E0B",
+    borderWidth: 1,
+    borderRadius: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  rerouteBannerText: {
+    color: "#F8FAFC",
+    fontSize: 12,
+    fontWeight: "600",
     flexShrink: 1,
   },
 

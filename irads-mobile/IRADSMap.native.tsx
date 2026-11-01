@@ -1,6 +1,7 @@
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import MapView, {
+  Circle,
   Marker,
   Polyline,
   PROVIDER_GOOGLE,
@@ -22,10 +23,19 @@ type IRADSMapProps = {
   showHeatmap: boolean;
   route: Coordinate[];
   hazards: Hazard[];
+  sourceCoordinate?: Coordinate | null;
+  sourceLabel?: string;
   destinationCoordinate?: Coordinate | null;
   destinationLabel?: string;
+  pendingMapCoordinate?: Coordinate | null;
+  onMapLongPress?: (coordinate: Coordinate) => void;
   recenterRequest?: number;
 };
+
+const DEFAULT_LATITUDE_DELTA = 0.055;
+const DEFAULT_LONGITUDE_DELTA = 0.055;
+const NAVIGATION_LATITUDE_DELTA = 0.008;
+const NAVIGATION_LONGITUDE_DELTA = 0.008;
 
 const DARK_MAP_STYLE = [
   { elementType: "geometry", stylers: [{ color: "#17212b" }] },
@@ -41,42 +51,6 @@ const DARK_MAP_STYLE = [
   { featureType: "water", elementType: "geometry.fill", stylers: [{ color: "#0c1822" }] },
 ];
 
-// Find the closest point on the route and keep only the route ahead.
-// Coordinates are projected into a local metre-based plane for stable GPS snapping.
-function routeAhead(route: Coordinate[], location: Coordinate): Coordinate[] {
-  if (route.length < 2) return route;
-  const metresPerDegreeLat = 111_195;
-  const metresPerDegreeLon = metresPerDegreeLat * Math.cos(location.latitude * Math.PI / 180);
-  let bestDistance = Infinity;
-  let bestIndex = -1;
-  let bestT = 0;
-  for (let i = 0; i < route.length - 1; i++) {
-    const a = route[i];
-    const b = route[i + 1];
-    const ax = (a.longitude - location.longitude) * metresPerDegreeLon;
-    const ay = (a.latitude - location.latitude) * metresPerDegreeLat;
-    const dx = (b.longitude - a.longitude) * metresPerDegreeLon;
-    const dy = (b.latitude - a.latitude) * metresPerDegreeLat;
-    const len2 = dx * dx + dy * dy;
-    const t = len2 > 0 ? Math.max(0, Math.min(1, -(ax * dx + ay * dy) / len2)) : 0;
-    const distance = Math.hypot(ax + t * dx, ay + t * dy);
-    if (distance < bestDistance) {
-      bestDistance = distance;
-      bestIndex = i;
-      bestT = t;
-    }
-  }
-  // Off-route GPS: preserve the route rather than erasing it unpredictably.
-  if (bestDistance > 30 || bestIndex < 0) return route;
-  const a = route[bestIndex];
-  const b = route[bestIndex + 1];
-  const snapped = {
-    latitude: a.latitude + (b.latitude - a.latitude) * bestT,
-    longitude: a.longitude + (b.longitude - a.longitude) * bestT,
-  };
-  return [snapped, ...route.slice(bestIndex + 1)];
-}
-
 export default function IRADSMap({
   currentLocation,
   initialCenter,
@@ -85,24 +59,25 @@ export default function IRADSMap({
   showHeatmap,
   route,
   hazards,
+  sourceCoordinate = null,
+  sourceLabel = "Starting point",
   destinationCoordinate = null,
   destinationLabel = "Destination",
+  pendingMapCoordinate = null,
+  onMapLongPress,
   recenterRequest = 0,
 }: IRADSMapProps) {
   const mapRef = useRef<MapView | null>(null);
   const lastRecenterRequest = useRef(recenterRequest);
   const initialRegion: Region = {
-    ...initialCenter,
-    latitudeDelta: 0.055,
-    longitudeDelta: 0.055,
+    latitude: initialCenter.latitude,
+    longitude: initialCenter.longitude,
+    latitudeDelta: DEFAULT_LATITUDE_DELTA,
+    longitudeDelta: DEFAULT_LONGITUDE_DELTA,
   };
-  const visibleRoute = useMemo(
-    () => isNavigating && currentLocation ? routeAhead(route, currentLocation) : route,
-    [isNavigating, currentLocation?.latitude, currentLocation?.longitude, route],
-  );
 
   useEffect(() => {
-    if (!routeSelected || isNavigating || route.length < 2 || !mapRef.current) return;
+    if (!routeSelected || route.length < 2 || !mapRef.current) return;
     const fitCoordinates = destinationCoordinate ? [...route, destinationCoordinate] : route;
     const timer = setTimeout(() => {
       mapRef.current?.fitToCoordinates(fitCoordinates, {
@@ -111,23 +86,38 @@ export default function IRADSMap({
       });
     }, 150);
     return () => clearTimeout(timer);
-  }, [routeSelected, isNavigating, route, destinationCoordinate]);
+  }, [routeSelected, route, destinationCoordinate]);
 
   useEffect(() => {
-    if (routeSelected || !currentLocation || !mapRef.current) return;
-    mapRef.current.animateToRegion({ ...currentLocation, latitudeDelta: 0.055, longitudeDelta: 0.055 }, 300);
-  }, [routeSelected, currentLocation?.latitude, currentLocation?.longitude]);
+    if (routeSelected || !currentLocation || !mapRef.current || pendingMapCoordinate) return;
+    mapRef.current.animateToRegion({
+      latitude: currentLocation.latitude,
+      longitude: currentLocation.longitude,
+      latitudeDelta: DEFAULT_LATITUDE_DELTA,
+      longitudeDelta: DEFAULT_LONGITUDE_DELTA,
+    }, 300);
+  }, [routeSelected, currentLocation?.latitude, currentLocation?.longitude, pendingMapCoordinate]);
 
   useEffect(() => {
     if (!isNavigating || !currentLocation || !mapRef.current) return;
-    mapRef.current.animateToRegion({ ...currentLocation, latitudeDelta: 0.008, longitudeDelta: 0.008 }, 500);
+    mapRef.current.animateToRegion({
+      latitude: currentLocation.latitude,
+      longitude: currentLocation.longitude,
+      latitudeDelta: NAVIGATION_LATITUDE_DELTA,
+      longitudeDelta: NAVIGATION_LONGITUDE_DELTA,
+    }, 500);
   }, [isNavigating, currentLocation?.latitude, currentLocation?.longitude]);
 
   useEffect(() => {
     if (lastRecenterRequest.current === recenterRequest) return;
     lastRecenterRequest.current = recenterRequest;
     if (!currentLocation || !mapRef.current) return;
-    mapRef.current.animateToRegion({ ...currentLocation, latitudeDelta: 0.008, longitudeDelta: 0.008 }, 500);
+    mapRef.current.animateToRegion({
+      latitude: currentLocation.latitude,
+      longitude: currentLocation.longitude,
+      latitudeDelta: NAVIGATION_LATITUDE_DELTA,
+      longitudeDelta: NAVIGATION_LONGITUDE_DELTA,
+    }, 500);
   }, [recenterRequest, currentLocation?.latitude, currentLocation?.longitude]);
 
   return (
@@ -142,9 +132,21 @@ export default function IRADSMap({
         showsUserLocation={false}
         showsMyLocationButton={false}
         loadingEnabled
+        onLongPress={(event) => {
+          if (isNavigating) return;
+          const coordinate = event.nativeEvent.coordinate;
+          if (Number.isFinite(coordinate.latitude) && Number.isFinite(coordinate.longitude)) {
+            onMapLongPress?.({ latitude: coordinate.latitude, longitude: coordinate.longitude });
+          }
+        }}
       >
-        {routeSelected && visibleRoute.length >= 2 && (
-          <Polyline coordinates={visibleRoute} strokeColor="#38BDF8" strokeWidth={5} lineCap="round" lineJoin="round" />
+        {currentLocation && (
+          <Marker coordinate={currentLocation} title="My current location" description="Live GPS position" anchor={{ x: 0.5, y: 0.5 }} zIndex={3000}>
+            <View style={styles.locationOuter}><View style={styles.locationInner} /></View>
+          </Marker>
+        )}
+        {routeSelected && route.length >= 2 && (
+          <Polyline coordinates={route} strokeColor="#38BDF8" strokeWidth={5} lineCap="round" lineJoin="round" />
         )}
         {showHeatmap && hazards.map((hazard) => {
           const isPothole = hazard.type === "POTHOLE";
@@ -152,34 +154,19 @@ export default function IRADSMap({
           const confidence = Math.max(0, Math.min(1, Number(hazard.confidence ?? hazard.intensity) || 0));
           return (
             <React.Fragment key={hazard.id}>
-              <Marker
-                coordinate={hazard}
-                title={isPothole ? "Pothole" : "Speed breaker"}
-                description={`Confidence: ${(confidence * 100).toFixed(0)}%`}
-                anchor={{ x: 0.5, y: 0.5 }}
-                tracksViewChanges={false}
-              >
-                <View
-                  style={{
-                    width: 14,
-                    height: 14,
-                    borderRadius: 7,
-                    backgroundColor: color,
-                    borderWidth: 2,
-                    borderColor: "#FFFFFF",
-                  }}
-                />
-              </Marker>
+              <Circle center={hazard} radius={14 + confidence * 14} strokeColor={color} strokeWidth={2} fillColor={`${color}55`} />
+              <Marker coordinate={hazard} title={isPothole ? "Pothole" : "Speed breaker"} description={`Confidence: ${(confidence * 100).toFixed(0)}%`} pinColor={color} tracksViewChanges={false} />
             </React.Fragment>
           );
         })}
+        {sourceCoordinate && (
+          <Marker coordinate={sourceCoordinate} title={sourceLabel} description="Selected starting location" pinColor="#22C55E" zIndex={1900} tracksViewChanges={false} />
+        )}
         {destinationCoordinate && (
           <Marker coordinate={destinationCoordinate} title={destinationLabel} description="Selected destination" pinColor="#EF4444" zIndex={2000} anchor={{ x: 0.5, y: 1 }} tracksViewChanges={false} />
         )}
-        {currentLocation && (
-          <Marker coordinate={currentLocation} title="My current location" description="Live GPS position" anchor={{ x: 0.5, y: 0.5 }} zIndex={3000}>
-            <View style={styles.locationOuter}><View style={styles.locationInner} /></View>
-          </Marker>
+        {pendingMapCoordinate && (
+          <Marker coordinate={pendingMapCoordinate} title="Selected map point" description="Choose Source or Destination" pinColor="#FACC15" zIndex={2500} tracksViewChanges={false} />
         )}
       </MapView>
     </View>
