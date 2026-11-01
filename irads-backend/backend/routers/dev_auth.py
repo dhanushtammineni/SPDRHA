@@ -77,7 +77,11 @@ def credential_digest(credential: str) -> str:
     ).hexdigest()
 
 
-async def registration_rate_limit(request: Request) -> None:
+
+async def registration_rate_limit(
+    request: Request,
+    device_id: str,
+) -> None:
     address = (
         request.client.host
         if request.client
@@ -94,9 +98,13 @@ async def registration_rate_limit(request: Request) -> None:
     )
 
     try:
+        ip_digest = hashlib.sha256(
+            address.encode()
+        ).hexdigest()
+
         key = (
-            "irads:registration:ip:"
-            + hashlib.sha256(address.encode()).hexdigest()
+            f"irads:registration:{ip_digest}:"
+            f"{device_id}"
         )
 
         script = """
@@ -107,7 +115,11 @@ async def registration_rate_limit(request: Request) -> None:
         return n
         """
 
-        count = await client.eval(script, 1, key)
+        count = await client.eval(
+            script,
+            1,
+            key,
+        )
 
         if count > 10:
             raise HTTPException(
@@ -123,6 +135,7 @@ async def registration_rate_limit(request: Request) -> None:
 
     finally:
         await client.aclose()
+
 
 
 @router.post("/api/v1/dev/register", status_code=201)
@@ -141,7 +154,7 @@ async def register_device(
 
     jwt_secret()
 
-    await registration_rate_limit(request)
+    await registration_rate_limit(request, device_id)
 
     pool = get_pool()
 
