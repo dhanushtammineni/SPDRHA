@@ -37,7 +37,6 @@ import type { SensorReading } from "./src/sensors/types";
 import { API_BASE_URL } from "./src/config";
 import { syncService } from "./src/storage/syncService";
 import { getDeviceIdHash } from "./src/storage/deviceIdentity";
-import { getPilotKey, savePilotKey } from "./src/storage/pilotCredentials";
 
 // The platform-specific map can accept newer optional props while the native
 // map implementation is updated separately. Expo Web resolves IRADSMap.web.tsx.
@@ -214,6 +213,30 @@ const REROUTE_MIN_SPEED_KMH = 3;
 const REROUTE_MAX_GPS_AGE_MS = 10000;
 const REROUTE_MAX_GPS_ACCURACY_METERS = 25;
 
+// Draw only the untraveled part of the navigation route without altering
+// the original route used for alerts, progress, and automatic rerouting.
+function remainingRouteGeometry(route: Coordinate[], distanceAlongMeters: number): Coordinate[] {
+  if (route.length < 2 || !Number.isFinite(distanceAlongMeters)) return route;
+  let traveled = 0;
+  for (let index = 0; index < route.length - 1; index++) {
+    const segmentLength = distanceMeters(route[index], route[index + 1]);
+    if (traveled + segmentLength >= distanceAlongMeters) {
+      const ratio = segmentLength > 0
+        ? Math.max(0, Math.min(1, (distanceAlongMeters - traveled) / segmentLength))
+        : 0;
+      const start = {
+        latitude: route[index].latitude +
+          (route[index + 1].latitude - route[index].latitude) * ratio,
+        longitude: route[index].longitude +
+          (route[index + 1].longitude - route[index].longitude) * ratio,
+      };
+      return [start, ...route.slice(index + 1)];
+    }
+    traveled += segmentLength;
+  }
+  return [route[route.length - 1]];
+}
+
 // ============================================================
 // APP
 // ============================================================
@@ -288,42 +311,16 @@ export default function App() {
 
   const [showHeatmap, setShowHeatmap] = useState(true);
   const [settingsVisible, setSettingsVisible] = useState(false);
-  const [pilotKeyInput, setPilotKeyInput] = useState("");
-  const [pilotKeySaved, setPilotKeySaved] = useState(false);
-  const [pilotDeviceId, setPilotDeviceId] = useState("");
-  const [pilotSaving, setPilotSaving] = useState(false);
+  const [registeredDeviceId, setRegisteredDeviceId] = useState("");
 
   useEffect(() => {
     if (!settingsVisible || Platform.OS === "web") return;
     let active = true;
-    void Promise.all([getDeviceIdHash(), getPilotKey()])
-      .then(([id, key]) => {
-        if (active) {
-          setPilotDeviceId(id);
-          setPilotKeySaved(Boolean(key));
-        }
-      })
-      .catch(() => {
-        if (active) showMessage("Pilot access", "Could not load device enrollment status.");
-      });
+    void getDeviceIdHash()
+      .then((id) => { if (active) setRegisteredDeviceId(id); })
+      .catch(() => { if (active) setRegisteredDeviceId(""); });
     return () => { active = false; };
   }, [settingsVisible]);
-
-  async function handleSavePilotKey() {
-    if (Platform.OS === "web" || pilotSaving) return;
-    setPilotSaving(true);
-    try {
-      await savePilotKey(pilotKeyInput);
-      setPilotKeyInput("");
-      setPilotKeySaved(true);
-      showMessage("Pilot access", "Key saved on this device. Enrollment will be verified when the backend is available.");
-      void syncService.syncPendingEvents();
-    } catch (error) {
-      showMessage("Pilot access", error instanceof Error ? error.message : "Could not save pilot access key.");
-    } finally {
-      setPilotSaving(false);
-    }
-  }
 
   const [routeSelected, setRouteSelected] = useState(false);
   const [isNavigating, setIsNavigating] = useState(false);
@@ -1268,6 +1265,13 @@ export default function App() {
     ? projectOntoRoute(currentLocation, routeCoordinates)
     : null;
 
+  // Only trim while actively navigating and close enough to the selected route.
+  // Keep the full route intact when planning or temporarily off route.
+  const visibleRoute = isNavigating && routeProgress &&
+    routeProgress.distanceToRouteMeters <= MAX_RIDER_ROUTE_OFFSET_METERS
+      ? remainingRouteGeometry(routeCoordinates, routeProgress.distanceAlongRouteMeters)
+      : routeCoordinates;
+
   const routeHazards = routeSelected && routeCoordinates.length >= 2
     ? hazards.filter((hazard) => {
         const projection = projectOntoRoute(hazard, routeCoordinates);
@@ -1982,6 +1986,7 @@ export default function App() {
           routeSelected={routeSelected}
           showHeatmap={showHeatmap}
           route={routeCoordinates}
+          visibleRoute={visibleRoute}
           hazards={mapHazards}
           sourceCoordinate={selectedSourceCoordinate}
           sourceLabel={source || "Starting point"}
@@ -2078,30 +2083,6 @@ export default function App() {
       {/* Bottom panel */}
 
       {!isNavigating && <View style={styles.bottomPanel}>
-        <View style={styles.heatmapRow}>
-          <View style={styles.heatmapTextContainer}>
-            <Text style={styles.heatmapTitle}>
-              Road anomaly heatmap
-            </Text>
-
-            <Text style={styles.heatmapSubtitle}>
-              Display nearby reported road anomalies
-            </Text>
-          </View>
-
-          <Switch
-            value={showHeatmap}
-            onValueChange={setShowHeatmap}
-            trackColor={{
-              false: "#344054",
-              true: "#0F766E",
-            }}
-            thumbColor={
-              showHeatmap ? "#5EEAD4" : "#D0D5DD"
-            }
-          />
-        </View>
-
         {/* Live anomaly status */}
 
         <View style={styles.anomalyStatus}>
@@ -2265,33 +2246,17 @@ export default function App() {
             </View>
             {Platform.OS !== "web" && (
               <View style={styles.pilotSection}>
-                <Text style={styles.settingsInfoHeading}>Pilot access</Text>
+                <Text style={styles.settingsInfoHeading}>Automatic device registration</Text>
                 <Text style={styles.settingsOptionHint}>
-                  {pilotKeySaved ? "A pilot key is saved on this device." : "No pilot key saved."}
+                  No pilot access key is required. Registration and authentication
+                  happen automatically when pending anomaly reports are synchronized.
                 </Text>
-                <Text style={styles.pilotDeviceIdLabel}>Device ID (share only with the pilot administrator)</Text>
-                <Text selectable style={styles.pilotDeviceIdValue}>{pilotDeviceId || "Loading..."}</Text>
-                <TextInput
-                  style={styles.pilotKeyInput}
-                  value={pilotKeyInput}
-                  onChangeText={setPilotKeyInput}
-                  placeholder={pilotKeySaved ? "Enter a replacement pilot key" : "Enter your pilot access key"}
-                  placeholderTextColor="#94A3B8"
-                  secureTextEntry
-                  autoCapitalize="none"
-                  autoCorrect={false}
-                  accessibilityLabel="Pilot access key"
-                />
-                <TouchableOpacity
-                  style={styles.pilotSaveButton}
-                  onPress={() => void handleSavePilotKey()}
-                  disabled={pilotSaving || pilotKeyInput.trim().length < 32}
-                  accessibilityRole="button"
-                >
-                  <Text style={styles.pilotSaveButtonText}>{pilotSaving ? "Saving..." : "Save pilot key"}</Text>
-                </TouchableOpacity>
+                <Text style={styles.pilotDeviceIdLabel}>Device ID</Text>
+                <Text selectable style={styles.pilotDeviceIdValue}>
+                  {registeredDeviceId || "Unavailable"}
+                </Text>
                 <Text style={styles.settingsOptionHint}>
-                  Saving a key does not confirm server enrollment. Never share your key or include it in screenshots.
+                  Having a device ID does not confirm server registration.
                 </Text>
               </View>
             )}
@@ -2823,23 +2788,6 @@ const styles = StyleSheet.create({
   },
   pilotDeviceIdLabel: { color: "#94A3B8", fontSize: 12 },
   pilotDeviceIdValue: { color: "#CBD5E1", fontSize: 11 },
-  pilotKeyInput: {
-    color: "#F8FAFC",
-    borderColor: "#64748B",
-    borderWidth: 1,
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-  },
-  pilotSaveButton: {
-    backgroundColor: "#0F766E",
-    borderRadius: 10,
-    alignItems: "center",
-    paddingVertical: 12,
-  },
-  pilotSaveButtonText: { color: "#FFFFFF", fontWeight: "700" },
-
-
   navDestinationBanner: {
     marginHorizontal: 12,
     marginBottom: 8,
@@ -2919,30 +2867,6 @@ const styles = StyleSheet.create({
     paddingHorizontal: 14,
     paddingTop: 10,
     paddingBottom: 8,
-  },
-
-  heatmapRow: {
-    minHeight: 65,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 8,
-  },
-
-  heatmapTextContainer: {
-    flex: 1,
-  },
-
-  heatmapTitle: {
-    fontSize: 14,
-    color: "#F8FAFC",
-    fontWeight: "600",
-  },
-
-  heatmapSubtitle: {
-    color: "#94A3B8",
-    fontSize: 11,
-    marginTop: 4,
   },
 
   anomalyStatus: {

@@ -1,7 +1,6 @@
 import React, { useEffect, useRef } from "react";
 import { StyleSheet, View } from "react-native";
 import MapView, {
-  Circle,
   Marker,
   Polyline,
   PROVIDER_GOOGLE,
@@ -22,6 +21,7 @@ type IRADSMapProps = {
   isNavigating?: boolean;
   showHeatmap: boolean;
   route: Coordinate[];
+  visibleRoute?: Coordinate[];
   hazards: Hazard[];
   sourceCoordinate?: Coordinate | null;
   sourceLabel?: string;
@@ -58,6 +58,7 @@ export default function IRADSMap({
   isNavigating = false,
   showHeatmap,
   route,
+  visibleRoute,
   hazards,
   sourceCoordinate = null,
   sourceLabel = "Starting point",
@@ -145,18 +146,26 @@ export default function IRADSMap({
             <View style={styles.locationOuter}><View style={styles.locationInner} /></View>
           </Marker>
         )}
-        {routeSelected && route.length >= 2 && (
-          <Polyline coordinates={route} strokeColor="#38BDF8" strokeWidth={5} lineCap="round" lineJoin="round" />
+        {routeSelected && (visibleRoute ?? route).length >= 2 && (
+          <Polyline coordinates={visibleRoute ?? route} strokeColor="#38BDF8" strokeWidth={5} lineCap="round" lineJoin="round" />
         )}
         {showHeatmap && hazards.map((hazard) => {
           const isPothole = hazard.type === "POTHOLE";
           const color = isPothole ? "#EF4444" : "#F59E0B";
           const confidence = Math.max(0, Math.min(1, Number(hazard.confidence ?? hazard.intensity) || 0));
           return (
-            <React.Fragment key={hazard.id}>
-              <Circle center={hazard} radius={14 + confidence * 14} strokeColor={color} strokeWidth={2} fillColor={`${color}55`} />
-              <Marker coordinate={hazard} title={isPothole ? "Pothole" : "Speed breaker"} description={`Confidence: ${(confidence * 100).toFixed(0)}%`} pinColor={color} tracksViewChanges={false} />
-            </React.Fragment>
+            <Marker
+              key={hazard.id}
+              coordinate={hazard}
+              title={isPothole ? "Pothole" : "Speed breaker"}
+              description={`Confidence: ${(confidence * 100).toFixed(0)}%`}
+              anchor={{ x: 0.5, y: 0.5 }}
+              tracksViewChanges={false}
+            >
+              <View style={[styles.hazardDotOuter, { backgroundColor: color + "55", borderColor: color }]}>
+                <View style={[styles.hazardDotInner, { backgroundColor: color }]} />
+              </View>
+            </Marker>
           );
         })}
         {sourceCoordinate && (
@@ -176,6 +185,8 @@ export default function IRADSMap({
 const styles = StyleSheet.create({
   container: { flex: 1, minHeight: 220, width: "100%", height: "100%" },
   map: { width: "100%", height: "100%", minHeight: 220, backgroundColor: "#17212b" },
+  hazardDotOuter: { width: 17, height: 17, borderRadius: 9, borderWidth: 2, alignItems: "center", justifyContent: "center" },
+  hazardDotInner: { width: 7, height: 7, borderRadius: 4 },
   locationOuter: { width: 24, height: 24, borderRadius: 12, backgroundColor: "#FFFFFF", alignItems: "center", justifyContent: "center", elevation: 5 },
   locationInner: { width: 16, height: 16, borderRadius: 8, backgroundColor: "#2563EB" },
 });
