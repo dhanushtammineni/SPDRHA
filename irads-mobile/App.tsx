@@ -759,11 +759,11 @@ export default function App() {
                 setAiStatus(`Model: NORMAL (${percent}%).`);
               } else if (gps === null) {
                 setAiStatus(
-                  `TEST prediction: ${prediction.type} (${percent}%). Not saved (speed gate or GPS validation).`,
+                  `TEST prediction: ROAD ANOMALY (${percent}%). Not saved (speed gate or GPS validation).`,
                 );
               } else {
                 setAiStatus(
-                  `Model: ${prediction.type} (${percent}%). Checking confidence/cooldown and syncing eligible event.`,
+                  `Model: ROAD ANOMALY (${percent}%). Checking confidence/cooldown and syncing eligible event.`,
                 );
               }
             })
@@ -1145,7 +1145,7 @@ export default function App() {
     }
   }, [isNavigating, selectedDestinationCoordinate]);
 
-  // Update progress and warn once per pothole as live GPS changes.
+  // Update progress and warn once per road anomaly as live GPS changes.
   // Route geometry is used so nearby roads and hazards behind the rider
   // do not generate warnings. These are foreground-only alerts.
   useEffect(() => {
@@ -1175,7 +1175,7 @@ export default function App() {
         fix.accuracyM === null || fix.accuracyM > 30) return;
 
     const upcoming = hazards
-      .filter((hazard) => hazard.type === "POTHOLE" &&
+      .filter((hazard) =>
         !alertedHazardsRef.current.has(hazard.id))
       .map((hazard) => {
         const projected = projectOntoRoute(hazard, routeCoordinates);
@@ -1196,7 +1196,7 @@ export default function App() {
     const nearest = upcoming[0];
     if (!nearest) return;
 
-    // Alert only once per pothole during this navigation session.
+    // Alert only once per anomaly during this navigation session.
     alertedHazardsRef.current.add(nearest.id);
 
     const distance = Math.max(1, Math.round(nearest.distanceAhead));
@@ -1218,9 +1218,9 @@ export default function App() {
       potholeAheadTimerRef.current = null;
     }, 4000);
 
-    const message = `Warning! Pothole ahead in ${distance} metres.`;
+    const message = `Warning! Road anomaly ahead in ${distance} metres.`;
 
-    console.log("IRADS POTHOLE ALERT:", {
+    console.log("IRADS ROAD ANOMALY ALERT:", {
       anomalyId: nearest.id,
       distanceMeters: distance,
       confidenceLevel: level,
@@ -2280,7 +2280,7 @@ export default function App() {
       {predictionBanner !== null && (
         <View pointerEvents="none" style={styles.predictionBanner}>
           <Text style={styles.predictionBannerTitle}>
-            {predictionBanner.type === "POTHOLE" ? "AI predicts: POTHOLE" : "AI predicts: SPEED BREAKER"}
+            {"AI predicts: ROAD ANOMALY"}
           </Text>
           <Text style={styles.predictionBannerInfo}>
             Confidence: {(predictionBanner.confidence * 100).toFixed(1)}%  |  Predictions: {predictionBanner.count}
@@ -2295,7 +2295,7 @@ export default function App() {
       {isNavigating && potholeAheadAlert !== null && (
         <View pointerEvents="none" style={styles.potholeAheadPopup}>
           <View style={styles.potholeAheadHeader}>
-            <Text style={styles.potholeAheadTitle}>⚠ Pothole Ahead!</Text>
+            <Text style={styles.potholeAheadTitle}>⚠ Road Anomaly Ahead!</Text>
             <View style={[
               styles.potholeAheadBadge,
               { backgroundColor: potholeAheadAlert.level === "HIGH" ? "#5B2A35"
@@ -2320,9 +2320,7 @@ export default function App() {
           style={styles.detectionToast}
         >
           <Text style={styles.detectionToastTitle}>
-            {detectionToast === "POTHOLE"
-              ? "Pothole Detected!"
-              : "Speed Breaker Detected!"}
+            Road Anomaly Detected!
           </Text>
           <Text style={styles.detectionToastSubtitle}>
             Saved locally - Upload pending

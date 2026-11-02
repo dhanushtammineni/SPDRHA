@@ -132,13 +132,12 @@ export default function IRADSMap({
           </>
         )}
         {showHeatmap && hazards.map(hazard => {
-          const isPothole = hazard.type === "POTHOLE";
-          const color = isPothole ? "#ef4444" : "#f59e0b";
+          const color = "#ef4444";
           const confidence = Math.max(0, Math.min(1, hazard.confidence || hazard.intensity || 0));
           return (
             <React.Fragment key={hazard.id}>
               <CircleMarker center={[hazard.latitude, hazard.longitude]} radius={10 + confidence * 4} pathOptions={{ color, weight: 2, fillColor: color, fillOpacity: 0.48 }}>
-                <Popup><strong>{isPothole ? "Pothole" : "Speed breaker"}</strong><br />Confidence: {(confidence * 100).toFixed(0)}%</Popup>
+                <Popup><strong>Road anomaly</strong><br />Confidence: {(confidence * 100).toFixed(0)}%</Popup>
               </CircleMarker>
               <CircleMarker center={[hazard.latitude, hazard.longitude]} radius={4} pathOptions={{ color: "#ffffff", weight: 1, fillColor: color, fillOpacity: 1 }} />
             </React.Fragment>

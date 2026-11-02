@@ -150,14 +150,13 @@ export default function IRADSMap({
           <Polyline coordinates={visibleRoute ?? route} strokeColor="#38BDF8" strokeWidth={5} lineCap="round" lineJoin="round" />
         )}
         {showHeatmap && hazards.map((hazard) => {
-          const isPothole = hazard.type === "POTHOLE";
-          const color = isPothole ? "#EF4444" : "#F59E0B";
+          const color = "#EF4444";
           const confidence = Math.max(0, Math.min(1, Number(hazard.confidence ?? hazard.intensity) || 0));
           return (
             <Marker
               key={hazard.id}
               coordinate={hazard}
-              title={isPothole ? "Pothole" : "Speed breaker"}
+              title="Road anomaly"
               description={`Confidence: ${(confidence * 100).toFixed(0)}%`}
               anchor={{ x: 0.5, y: 0.5 }}
               tracksViewChanges={false}
