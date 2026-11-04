@@ -1,0 +1,3 @@
+aiokafka
+asyncpg
+python-dotenv

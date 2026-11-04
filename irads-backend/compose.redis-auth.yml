@@ -3,6 +3,11 @@
     command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
     volumes:
       - type: bind
-        source: C:/Users/dhanu/SPDRHA/irads-private/redis.conf
+        source: ${IRADS_REDIS_CONF_PATH}
         target: /usr/local/etc/redis/redis.conf
         read_only: true
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping 2>&1 | grep -q 'NOAUTH Authentication required'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
