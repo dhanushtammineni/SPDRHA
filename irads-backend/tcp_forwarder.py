@@ -26,7 +26,10 @@ async def open_socks(target, port, proxy_port=1055):
         await writer.drain()
         version, result, reserved, address_type = await reader.readexactly(4)
         if (version, result, reserved) != (5, 0, 0):
-            raise ConnectionError("SOCKS connection rejected")
+            raise ConnectionError(
+                f"SOCKS connection rejected: destination={target}:{port}, "
+                f"version={version}, result_code={result}, reserved={reserved}"
+                )
         if address_type == 1:
             await reader.readexactly(4)
         elif address_type == 4:
